@@ -18,4 +18,7 @@
     <string id="30016">Check for updates automatically on Kodi startup</string>
     <string id="30017">Update check interval</string>
     <string id="30018">Install updates automatically when available</string>
+    <string id="30019">Automatic cleanup when cache exceeds threshold</string>
+    <string id="30020">Threshold (cache + temp + thumbnails)</string>
+    <string id="30021">Automatic cleanup scope</string>
 </strings>

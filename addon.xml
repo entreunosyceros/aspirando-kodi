@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<addon id="script.aspirando-kodi" name="Aspirando Kodi" version="1.0.37" provider-name="entreunosyceros">
+<addon id="script.aspirando-kodi" name="Aspirando Kodi" version="1.0.41" provider-name="entreunosyceros">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
     </requires>
     <extension point="xbmc.python.script" library="default.py">
         <provides>executable</provides>
     </extension>
-    <extension point="xbmc.service" library="service.py" start="startup" />
+    <extension point="xbmc.service" library="service.py" start="login" />
     <extension point="xbmc.addon.metadata">
         <platform>all</platform>
         <summary>Limpiador y optimizador completo para Kodi: caché, thumbnails, buffering, optimizaciones de video e IPTV</summary>
@@ -24,6 +24,7 @@ Funciones principales:
 - Copias de seguridad y restauración de advancedsettings.xml con un clic
 - Guardar configuración de buffering en USB para usarla en otros equipos
 - Programar una limpieza completa al iniciar Kodi (incluye aviso antes de ejecutar)
+- Ver el estado del sistema, el historial de limpiezas y limpiar automáticamente si se supera un umbral
 - Compactar bases de datos (Textures, Addons, MyVideos) para mejorar rendimiento
 - Diagnóstico de dispositivos USB accesibles desde Kodi
 - Información del addon y acceso rápido al repositorio
@@ -47,8 +48,20 @@ Recomendación: tras cambiar la configuración de buffering o video, reinicia Ko
 
 ⚠️ IMPORTANTE ANDROID (v1.0.37): El addon incluye detección automática de configuraciones peligrosas que pueden causar cuelgues del dispositivo tras 2-3 minutos de reproducción. Al iniciar Kodi, si detecta un buffer excesivo (>80MB), mostrará una alerta con opción de corrección automática a 50MB (valor seguro). Ver documento SOLUCION_CUELGUE_ANDROID.md para diagnóstico completo.
 
-Actualizaciones del addon (v1.0.37): el addon puede comprobar nuevas versiones desde https://sapoclay.github.io/aspirando-kodi/, descargar el zip publicado e instalarlo desde el propio addon o automaticamente al iniciar Kodi.</description>
-    <news>v1.0.37
+Actualizaciones del addon: el addon comprueba nuevas versiones en https://entreunosyceros.github.io/aspirando-kodi/ y en la rama gh-pages de github.com/entreunosyceros/aspirando-kodi, descarga el zip publicado e instala la actualizacion desde el propio addon o automaticamente al iniciar Kodi.</description>
+    <news>v1.0.41
+- Corregido Programar limpieza al iniciar: siempre se puede activar aunque no haya residuos ahora
+v1.0.40
+- El actualizador consulta el repositorio oficial github.com/entreunosyceros/aspirando-kodi (gh-pages)
+- Si GitHub Pages no lista el zip, usa la API de GitHub y raw.githubusercontent.com como reserva
+v1.0.39
+- Panel de estado: espacio, cachés, limpieza programada, última limpieza y buffer
+- Historial de limpiezas con archivos eliminados y espacio liberado
+- Limpieza automática por umbral configurable (200/500/1000 MB) al iniciar o al parar la reproducción
+v1.0.38
+- Corregida la limpieza programada al iniciar Kodi: el servicio espera a que el perfil esté cargado y solo entonces ejecuta la limpieza
+- La limpieza borra el contenido real de caché, thumbnails, paquetes, temporales y residuos IPTV, aunque haya subcarpetas o archivos bloqueados
+v1.0.37
 - Nuevo sistema de actualizacion desde https://sapoclay.github.io/aspirando-kodi/
 - Comprobacion manual desde el menu principal
 - Comprobacion automatica configurable al iniciar Kodi

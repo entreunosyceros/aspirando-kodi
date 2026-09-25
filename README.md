@@ -7,7 +7,7 @@ Addon para Kodi orientado a limpieza, mantenimiento y optimización de reproducc
 ## Versión actual
 
 - Addon: `script.aspirando-kodi`
-- Versión: `1.0.37`
+- Versión: `1.0.41`
 - Requisito mínimo: Kodi 19 o superior
 - Runtime: Python 3 (`xbmc.python` 3.0.0)
 
@@ -33,7 +33,7 @@ Addon para Kodi orientado a limpieza, mantenimiento y optimización de reproducc
 
 Para mantener el addon actualizado automáticamente, te recomendamos añadir la fuente oficial a tu instalación de Kodi.
 
-El addon incorpora además un actualizador propio capaz de comprobar nuevas versiones en `https://sapoclay.github.io/aspirando-kodi/`, descargar el zip publicado e instalarlo desde el propio addon.
+El addon incorpora además un actualizador propio capaz de comprobar nuevas versiones en `https://entreunosyceros.github.io/aspirando-kodi/` y en la rama `gh-pages` de `https://github.com/entreunosyceros/aspirando-kodi`, descargar el zip publicado e instalarlo desde el propio addon.
 
 ### 1. Añadir la fuente a Kodi
 
@@ -41,7 +41,7 @@ El addon incorpora además un actualizador propio capaz de comprobar nuevas vers
 2. Entra en **Explorador de archivos** (File Manager).
 3. Haz clic en **Añadir fuente** (Add source).
 4. En el campo `<Ninguno>`, escribe exactamente la siguiente URL:
-   `https://sapoclay.github.io/aspirando-kodi/`
+   `https://entreunosyceros.github.io/aspirando-kodi/`
 5. En el nombre de la fuente, escribe **Aspirando** (o el nombre que prefieras) y pulsa **OK**.
 
 ### 2. Instalar el Addon
@@ -220,7 +220,7 @@ Esto reduce el riesgo de cuelgues típicos en Android tras varios minutos de rep
 - `buffering.py`: lógica de buffering, USB, backups y `advancedsettings.xml`.
 - `service.py`: servicio de inicio, limpieza programada y auto-limpieza al terminar reproducción.
 - `addon.xml`: metadatos del addon.
-- `dist/script.aspirando-kodi-1.0.37.zip`: paquete instalable.
+- `dist/script.aspirando-kodi-1.0.41.zip`: paquete instalable.
 
 ## Cambios reflejados en esta documentación
 

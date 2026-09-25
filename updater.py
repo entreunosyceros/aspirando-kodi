@@ -14,7 +14,12 @@ import xbmcgui
 import xbmcvfs
 
 
-UPDATE_BASE_URL = 'https://sapoclay.github.io/aspirando-kodi/'
+UPDATE_BASE_URL = 'https://entreunosyceros.github.io/aspirando-kodi/'
+GITHUB_PAGES_URL = 'https://entreunosyceros.github.io/aspirando-kodi/'
+GITHUB_RAW_INDEX_URL = 'https://raw.githubusercontent.com/entreunosyceros/aspirando-kodi/gh-pages/index.html'
+GITHUB_CONTENTS_URL = 'https://api.github.com/repos/entreunosyceros/aspirando-kodi/contents/?ref=gh-pages'
+GITHUB_RAW_BASE_URL = 'https://raw.githubusercontent.com/entreunosyceros/aspirando-kodi/gh-pages/'
+LEGACY_PAGES_URL = 'https://sapoclay.github.io/aspirando-kodi/'
 STATE_FILENAME = 'update_state.json'
 DOWNLOADS_DIRNAME = 'updates'
 BACKUPS_DIRNAME = 'addon_update_backups'
@@ -189,12 +194,55 @@ def detect_platform():
     }
 
 
-def _absolute_url(path_or_url):
+def _absolute_url(path_or_url, base_url=UPDATE_BASE_URL):
     if not path_or_url:
         return ''
     if re.match(r'^https?://', path_or_url):
         return path_or_url
-    return urllib.parse.urljoin(UPDATE_BASE_URL, str(path_or_url).lstrip('/'))
+    return urllib.parse.urljoin(base_url, str(path_or_url).lstrip('/'))
+
+
+def _candidate_from_package(package_name, download_url, notes=''):
+    if addon_id not in (package_name or ''):
+        return None
+    remote_version = _extract_version_from_name(package_name)
+    if not remote_version:
+        return None
+    return {
+        'remote_version': remote_version,
+        'download_url': download_url,
+        'notes': notes,
+        'sha256': '',
+        'package_name': package_name,
+    }
+
+
+def _pick_latest_candidate(candidates):
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (_normalize_version(item['remote_version']), item['package_name']),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def _candidates_from_text(index_text, base_url):
+    candidates = []
+    seen = set()
+    zip_links = re.findall(r'href=["\']([^"\']+\.zip)["\']', index_text, re.IGNORECASE)
+    zip_links.extend(re.findall(r'(script\.aspirando-kodi-\d+(?:\.\d+)+\.zip)', index_text, re.IGNORECASE))
+    for link in zip_links:
+        absolute_url = _absolute_url(link, base_url)
+        package_name = os.path.basename(urllib.parse.urlparse(absolute_url).path)
+        if package_name in seen:
+            continue
+        candidate = _candidate_from_package(package_name, absolute_url)
+        if not candidate:
+            continue
+        seen.add(package_name)
+        candidates.append(candidate)
+    return candidates
 
 
 def _fetch_text(url):
@@ -212,38 +260,72 @@ def _extract_version_from_name(file_name):
     return match.group(1) if match else ''
 
 
-def _find_release_from_index():
-    index_text = _fetch_text(UPDATE_BASE_URL)
-    zip_links = re.findall(r'href=["\']([^"\']+\.zip)["\']', index_text, re.IGNORECASE)
-    candidates = []
-    for link in zip_links:
-        absolute_url = _absolute_url(link)
-        package_name = os.path.basename(urllib.parse.urlparse(absolute_url).path)
-        if addon_id not in package_name:
-            continue
-        remote_version = _extract_version_from_name(package_name)
-        if not remote_version:
-            continue
-        candidates.append({
-            'remote_version': remote_version,
-            'download_url': absolute_url,
-            'notes': '',
-            'sha256': '',
-            'package_name': package_name,
-        })
+def _find_release_from_index(index_url, base_url=None):
+    index_text = _fetch_text(index_url)
+    candidates = _candidates_from_text(index_text, base_url or index_url)
+    latest = _pick_latest_candidate(candidates)
+    if not latest:
+        raise RuntimeError('No se encontraron paquetes remotos del addon en %s' % index_url)
+    latest['notes'] = 'Repositorio: %s' % UPDATE_BASE_URL
+    return latest
 
-    if not candidates:
-        raise RuntimeError('No se encontraron paquetes remotos del addon en %s' % UPDATE_BASE_URL)
 
-    candidates.sort(
-        key=lambda item: (_normalize_version(item['remote_version']), item['package_name']),
-        reverse=True,
+def _find_release_from_github_api():
+    request = urllib.request.Request(
+        GITHUB_CONTENTS_URL,
+        headers={
+            'User-Agent': '%s/%s' % (addon_id, addon_version),
+            'Accept': 'application/vnd.github+json',
+        },
     )
-    return candidates[0]
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        charset = response.headers.get_content_charset() or 'utf-8'
+        payload = json.loads(response.read().decode(charset, 'replace'))
+
+    if not isinstance(payload, list):
+        raise RuntimeError('La API de GitHub no devolvió el listado de gh-pages')
+
+    candidates = []
+    for item in payload:
+        if not isinstance(item, dict) or item.get('type') != 'file':
+            continue
+        package_name = str(item.get('name') or '')
+        download_url = (
+            item.get('download_url')
+            or _absolute_url(package_name, GITHUB_PAGES_URL)
+            or _absolute_url(package_name, GITHUB_RAW_BASE_URL)
+        )
+        candidate = _candidate_from_package(package_name, download_url)
+        if candidate:
+            candidates.append(candidate)
+
+    latest = _pick_latest_candidate(candidates)
+    if not latest:
+        raise RuntimeError('No se encontraron paquetes del addon en la rama gh-pages')
+    latest['notes'] = 'Publicado en github.com/entreunosyceros/aspirando-kodi (gh-pages)'
+    return latest
 
 
 def _resolve_remote_release():
-    return _find_release_from_index()
+    errors = []
+    lookups = (
+        _find_release_from_github_api,
+        lambda: _find_release_from_index(GITHUB_PAGES_URL, GITHUB_PAGES_URL),
+        lambda: _find_release_from_index(GITHUB_RAW_INDEX_URL, GITHUB_RAW_BASE_URL),
+        lambda: _find_release_from_index(LEGACY_PAGES_URL, LEGACY_PAGES_URL),
+    )
+    for lookup in lookups:
+        try:
+            release = lookup()
+            log('Actualizacion remota encontrada: %s (%s)' % (
+                release.get('remote_version', ''),
+                release.get('download_url', ''),
+            ))
+            return release
+        except Exception as error:
+            errors.append(str(error))
+            log('Fuente de actualizacion no disponible: %s' % str(error))
+    raise RuntimeError('No se pudo consultar el repositorio de actualizaciones: %s' % ' | '.join(errors))
 
 
 def _download_file(url, target_path):
@@ -452,8 +534,26 @@ def install_update(update_info, interactive=True):
     try:
         if interactive:
             xbmcgui.Dialog().notification(addon_name, 'Descargando actualizacion %s...' % update_info.get('remote_version', ''), time=3000)
-        log('Descargando paquete de actualizacion desde %s' % update_info.get('download_url', ''))
-        _download_file(update_info.get('download_url', ''), package_path)
+        download_urls = []
+        for url in (
+            update_info.get('download_url', ''),
+            _absolute_url(package_name, GITHUB_PAGES_URL),
+            _absolute_url(package_name, GITHUB_RAW_BASE_URL),
+        ):
+            if url and url not in download_urls:
+                download_urls.append(url)
+        last_error = None
+        for download_url in download_urls:
+            try:
+                log('Descargando paquete de actualizacion desde %s' % download_url)
+                _download_file(download_url, package_path)
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                log('Fallo la descarga desde %s: %s' % (download_url, str(error)))
+        if last_error:
+            raise last_error
 
         expected_sha256 = str(update_info.get('sha256', '') or '').strip().lower()
         if expected_sha256:

@@ -22,4 +22,7 @@
     <string id="30016">Comprobar actualizaciones automaticamente al iniciar Kodi</string>
     <string id="30017">Intervalo de comprobacion de actualizaciones</string>
     <string id="30018">Instalar actualizaciones automaticamente cuando haya una nueva version</string>
+    <string id="30019">Limpieza automática si se supera el umbral</string>
+    <string id="30020">Umbral (caché + temporales + thumbnails)</string>
+    <string id="30021">Alcance de la limpieza automática</string>
 </strings>

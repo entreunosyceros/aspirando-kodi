@@ -1337,63 +1337,6 @@ def configure_usb_cachepath(config_path):
         log('Error configurando %s como cache: %s' % (device_label(), str(e)))
         xbmcgui.Dialog().ok('Error', 'Error configurando cache en almacenamiento externo: %s' % str(e))
 
-def configure_external_cachepath_android(config_path):
-    try:
-        if not is_android():
-            return configure_usb_cachepath(config_path)
-        dialog = xbmcgui.Dialog()
-        devices = detect_usb_devices()
-        if not devices:
-            sel = browse_for_usb_folder()
-            if sel:
-                devices = [{'name': os.path.basename(sel) or 'Almacenamiento', 'path': sel}]
-        if not devices:
-            dialog.ok('Sin almacenamiento', 'No se detectaron ubicaciones y no se seleccionó carpeta.')
-            return
-        labels = ['%s (%s)' % (d['path'], d.get('free', '')) for d in devices]
-        idx = dialog.select('Selecciona almacenamiento para cache', labels)
-        if idx == -1:
-            return
-        selected = devices[idx]
-        cache_dir = os.path.join(selected['path'], 'KodiCache')
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-        except Exception:
-            pass
-        config = '''<advancedsettings>
-    <network>
-        <buffermode>2</buffermode>
-        <cachemembuffersize>0</cachemembuffersize>
-        <readbufferfactor>4.0</readbufferfactor>
-    </network>
-    <video>
-        <memorysize>0</memorysize>
-        <readbufferfactor>4.0</readbufferfactor>
-    </video>
-    <cache>
-        <cachepath>%s</cachepath>
-    </cache>
-</advancedsettings>''' % cache_dir
-        backup_advancedsettings(config_path)
-        parent = os.path.dirname(config_path)
-        try:
-            if parent and not os.path.exists(parent):
-                os.makedirs(parent, exist_ok=True)
-        except Exception:
-            pass
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                f.write(config)
-        except Exception:
-            fh = xbmcvfs.File(config_path, 'w')
-            fh.write(config)
-            fh.close()
-        dialog.ok('Cache externa configurada', 'cachepath: %s\nReinicia Kodi para aplicar.' % cache_dir)
-        log('cachepath configurado en: %s' % cache_dir)
-    except Exception as e:
-        log('Error configurando cache externo Android: %s' % str(e))
-        xbmcgui.Dialog().ok('Error', 'Error configurando cache externo: %s' % str(e))
-
 def read_speed(urls=None, timeout=15):
     try:
         urls = urls or [

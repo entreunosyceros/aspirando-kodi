@@ -73,6 +73,436 @@ def format_size(bytes_size):
         return "%.1f GB" % (bytes_size / (1024.0 * 1024.0 * 1024.0))
 
 
+CLEAN_HISTORY_FILENAME = 'clean_history.json'
+CLEAN_HISTORY_LIMIT = 30
+THRESHOLD_STAMP_FILENAME = 'threshold_last.json'
+THRESHOLD_COOLDOWN_SECONDS = 30 * 60
+THRESHOLD_SIZES = {
+    '0': 200 * 1024 * 1024,
+    '1': 500 * 1024 * 1024,
+    '2': 1000 * 1024 * 1024,
+}
+THRESHOLD_LABELS = {
+    '0': '200 MB',
+    '1': '500 MB',
+    '2': '1000 MB',
+}
+THRESHOLD_SCOPE_LABELS = {
+    '0': 'Caché y temporales',
+    '1': 'Caché, temporales y thumbnails',
+    '2': 'Limpieza completa',
+}
+
+
+def _setting_bool(setting_id, default=False):
+    try:
+        value = addon.getSetting(setting_id)
+    except Exception:
+        value = ''
+    if value in ('', None):
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _setting_value(setting_id, default='0'):
+    try:
+        value = addon.getSetting(setting_id)
+    except Exception:
+        value = ''
+    if value in ('', None):
+        return default
+    return str(value).strip()
+
+
+def get_clean_history_path():
+    return os.path.join(addon_data_dir, CLEAN_HISTORY_FILENAME)
+
+
+def load_clean_history():
+    path = get_clean_history_path()
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        entries = data.get('entries', []) if isinstance(data, dict) else data
+        return entries if isinstance(entries, list) else []
+    except Exception as error:
+        log('No se pudo leer el historial de limpiezas: %s' % str(error))
+        return []
+
+
+def record_clean_event(kind, removed_count=0, removed_size=0, leftover=0, source='manual', ok=True):
+    try:
+        os.makedirs(addon_data_dir, exist_ok=True)
+        entries = load_clean_history()
+        entries.insert(0, {
+            'when': datetime.datetime.now().isoformat(timespec='seconds'),
+            'kind': kind,
+            'source': source,
+            'removed_count': int(removed_count or 0),
+            'removed_size': int(removed_size or 0),
+            'leftover': int(leftover or 0),
+            'ok': bool(ok),
+        })
+        with open(get_clean_history_path(), 'w', encoding='utf-8') as handle:
+            json.dump({'entries': entries[:CLEAN_HISTORY_LIMIT]}, handle, ensure_ascii=False, indent=2)
+    except Exception as error:
+        log('No se pudo guardar el historial de limpiezas: %s' % str(error))
+
+
+def leftover_for_kind(kind):
+    try:
+        if kind == 'cache':
+            return get_cache_info()[1]
+        if kind == 'thumbnails':
+            return get_thumbnails_info()[1]
+        if kind == 'packages':
+            return get_packages_info()[1]
+        if kind == 'temp':
+            return get_temp_info()[1]
+        if kind == 'streaming':
+            return get_streaming_artifacts_info()[1]
+        if kind in ('completa', 'umbral'):
+            return (
+                get_cache_info()[1]
+                + get_thumbnails_info()[1]
+                + get_packages_info()[1]
+                + get_temp_info()[1]
+                + get_streaming_artifacts_info()[1]
+            )
+    except Exception:
+        return 0
+    return 0
+
+
+def get_dirty_cache_size():
+    cache_size, _ = get_cache_info()
+    thumb_size, _ = get_thumbnails_info()
+    temp_size, _ = get_temp_info()
+    return cache_size + thumb_size + temp_size
+
+
+def get_profile_disk_usage():
+    paths = get_kodi_paths()
+    profile_path = paths.get('advancedsettings') or ''
+    root = os.path.dirname(profile_path) if profile_path else _translate('special://profile/')
+    try:
+        stat = os.statvfs(root)
+        total = stat.f_frsize * stat.f_blocks
+        free = stat.f_frsize * stat.f_bavail
+        used = max(0, total - free)
+        return used, free, total
+    except Exception:
+        return 0, 0, 0
+
+
+def get_schedule_status():
+    schedule_path = os.path.join(addon_data_dir, 'schedule_clean.json')
+    if not os.path.exists(schedule_path):
+        return {'active': False, 'repeat': False, 'created': ''}
+    try:
+        with open(schedule_path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        return {
+            'active': bool(data.get('scheduled')),
+            'repeat': bool(data.get('repeat')),
+            'created': data.get('created', ''),
+        }
+    except Exception:
+        return {'active': False, 'repeat': False, 'created': ''}
+
+
+def get_buffer_status():
+    paths = get_kodi_paths()
+    config_path = paths.get('advancedsettings', '')
+    if not config_path or not os.path.exists(config_path):
+        return {'configured': False, 'mem': 0, 'android_warn': False}
+    try:
+        with open(config_path, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+        match = re.search(r'<cachemembuffersize>(\d+)</cachemembuffersize>', content)
+        mem = int(match.group(1)) if match else 0
+        is_android = False
+        try:
+            is_android = bool(xbmc.getCondVisibility('system.platform.android'))
+        except Exception:
+            is_android = False
+        return {
+            'configured': True,
+            'mem': mem,
+            'android_warn': is_android and mem > 83886080,
+        }
+    except Exception:
+        return {'configured': True, 'mem': 0, 'android_warn': False}
+
+
+def get_threshold_preferences():
+    enabled = _setting_bool('auto_threshold_enabled', False)
+    size_key = _setting_value('auto_threshold_size', '1')
+    scope_key = _setting_value('auto_threshold_scope', '0')
+    return {
+        'enabled': enabled,
+        'bytes': THRESHOLD_SIZES.get(size_key, THRESHOLD_SIZES['1']),
+        'size_label': THRESHOLD_LABELS.get(size_key, '500 MB'),
+        'scope': scope_key,
+        'scope_label': THRESHOLD_SCOPE_LABELS.get(scope_key, THRESHOLD_SCOPE_LABELS['0']),
+    }
+
+
+def _threshold_stamp_path():
+    return os.path.join(addon_data_dir, THRESHOLD_STAMP_FILENAME)
+
+
+def _threshold_recently_ran():
+    path = _threshold_stamp_path()
+    try:
+        if not os.path.exists(path):
+            return False
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        last = float(data.get('when', 0) or 0)
+        return (time.time() - last) < THRESHOLD_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _mark_threshold_ran():
+    try:
+        os.makedirs(addon_data_dir, exist_ok=True)
+        with open(_threshold_stamp_path(), 'w', encoding='utf-8') as handle:
+            json.dump({'when': time.time()}, handle)
+    except Exception as error:
+        log('No se pudo guardar el sello de umbral: %s' % str(error))
+
+
+def _format_history_when(value):
+    text = str(value or '')
+    if 'T' in text:
+        return text.replace('T', ' ')
+    return text or 'fecha desconocida'
+
+
+def show_system_status():
+    """Muestra un resumen del estado de Kodi y de las limpiezas."""
+    try:
+        cache_size, cache_files = get_cache_info()
+        thumb_size, thumb_files = get_thumbnails_info()
+        pack_size, pack_files = get_packages_info()
+        temp_size, temp_files = get_temp_info()
+        stream_size, stream_files = get_streaming_artifacts_info()
+        dirty = cache_size + thumb_size + temp_size
+        used, free, total = get_profile_disk_usage()
+        schedule = get_schedule_status()
+        buffer_info = get_buffer_status()
+        history = load_clean_history()
+        threshold = get_threshold_preferences()
+
+        if schedule.get('active'):
+            schedule_line = 'Activa (%s)' % ('en cada inicio' if schedule.get('repeat') else 'próximo inicio')
+            if schedule.get('created'):
+                schedule_line += '\n  Desde: %s' % _format_history_when(schedule.get('created'))
+        else:
+            schedule_line = 'No hay limpieza programada'
+
+        if history:
+            last = history[0]
+            last_line = '%s · %s · %s liberados' % (
+                _format_history_when(last.get('when')),
+                last.get('kind', 'limpia'),
+                format_size(last.get('removed_size', 0)),
+            )
+            if last.get('leftover'):
+                last_line += ' · quedan %d archivos' % int(last.get('leftover') or 0)
+        else:
+            last_line = 'Todavía no hay limpiezas registradas'
+
+        if buffer_info.get('configured'):
+            buffer_line = format_size(buffer_info.get('mem', 0))
+            if buffer_info.get('android_warn'):
+                buffer_line += '  (aviso: en Android supera 80 MB)'
+        else:
+            buffer_line = 'Sin advancedsettings.xml'
+
+        lines = [
+            'ESTADO DEL SISTEMA',
+            '=' * 40,
+            '',
+            'Disco del perfil de Kodi:',
+            '  Usado: %s' % format_size(used),
+            '  Libre: %s' % format_size(free),
+            '  Total: %s' % format_size(total),
+            '',
+            'Residuos actuales:',
+            '  Caché: %d archivos (%s)' % (cache_files, format_size(cache_size)),
+            '  Thumbnails: %d archivos (%s)' % (thumb_files, format_size(thumb_size)),
+            '  Paquetes: %d archivos (%s)' % (pack_files, format_size(pack_size)),
+            '  Temporales: %d archivos (%s)' % (temp_files, format_size(temp_size)),
+            '  Streaming/IPTV: %d archivos (%s)' % (stream_files, format_size(stream_size)),
+            '  Caché + temp + thumbnails: %s' % format_size(dirty),
+            '',
+            'Limpieza programada: %s' % schedule_line,
+            'Última limpieza: %s' % last_line,
+            'Buffer en memoria: %s' % buffer_line,
+            '',
+            'Limpieza por umbral: %s' % ('activada' if threshold['enabled'] else 'desactivada'),
+        ]
+        if threshold['enabled']:
+            lines.append('  Umbral: %s' % threshold['size_label'])
+            lines.append('  Alcance: %s' % threshold['scope_label'])
+            if dirty >= threshold['bytes']:
+                lines.append('  Estado: se superó el umbral')
+            else:
+                lines.append('  Estado: por debajo del umbral')
+
+        xbmcgui.Dialog().textviewer('Estado del sistema', '\n'.join(lines))
+    except Exception as error:
+        log('Error mostrando el estado del sistema: %s' % str(error))
+        xbmcgui.Dialog().ok('Error', 'No se pudo mostrar el estado del sistema: %s' % str(error))
+
+
+def show_clean_history():
+    """Muestra el historial reciente de limpiezas."""
+    try:
+        entries = load_clean_history()
+        if not entries:
+            xbmcgui.Dialog().ok('Historial de limpiezas', 'Todavía no hay limpiezas registradas.')
+            return
+
+        lines = ['HISTORIAL DE LIMPIEZAS', '=' * 40, '']
+        for entry in entries:
+            leftover = int(entry.get('leftover') or 0)
+            leftover_text = 'quedan %d archivos' % leftover if leftover else 'sin residuos detectados'
+            lines.extend([
+                _format_history_when(entry.get('when')),
+                '  Tipo: %s (%s)' % (entry.get('kind', 'limpia'), entry.get('source', 'manual')),
+                '  Eliminados: %d archivos (%s)' % (
+                    int(entry.get('removed_count') or 0),
+                    format_size(entry.get('removed_size', 0)),
+                ),
+                '  Resultado: %s · %s' % (
+                    'ok' if entry.get('ok', True) else 'incompleta',
+                    leftover_text,
+                ),
+                '',
+            ])
+        xbmcgui.Dialog().textviewer('Historial de limpiezas', '\n'.join(lines).rstrip())
+    except Exception as error:
+        log('Error mostrando el historial: %s' % str(error))
+        xbmcgui.Dialog().ok('Error', 'No se pudo mostrar el historial: %s' % str(error))
+
+
+def show_status_and_maintenance():
+    """Submenú de estado, historial y limpieza automática."""
+    dialog = xbmcgui.Dialog()
+    while True:
+        threshold = get_threshold_preferences()
+        threshold_label = 'Limpieza por umbral: %s' % (
+            '%s · %s' % (threshold['size_label'], threshold['scope_label']) if threshold['enabled'] else 'desactivada'
+        )
+        choice = dialog.select('Estado y mantenimiento', [
+            'Ver estado del sistema',
+            'Historial de limpiezas',
+            threshold_label,
+            'Volver',
+        ])
+        if choice in (-1, 3):
+            return
+        if choice == 0:
+            show_system_status()
+        elif choice == 1:
+            show_clean_history()
+        elif choice == 2:
+            try:
+                addon.openSettings()
+            except Exception as error:
+                log('No se pudieron abrir los ajustes: %s' % str(error))
+                dialog.ok(
+                    'Limpieza por umbral',
+                    'Actívala en Ajustes del addon.\n\n'
+                    'Si caché + temporales + thumbnails superan el umbral,\n'
+                    'el servicio limpiará al iniciar Kodi.'
+                )
+
+
+def _clean_cache_dirs():
+    removed_count = 0
+    removed_size = 0
+    for cache_path in _cache_dirs():
+        count, size_removed = safe_remove_folder_contents(cache_path)
+        removed_count += count
+        removed_size += size_removed
+    return removed_count, removed_size
+
+
+def maybe_run_threshold_clean(source='startup', cache_temp_only=False):
+    """Limpia si caché + temp + thumbnails superan el umbral configurado."""
+    prefs = get_threshold_preferences()
+    if not prefs['enabled']:
+        log('Limpieza por umbral desactivada')
+        return False
+
+    dirty = get_dirty_cache_size()
+    if dirty < prefs['bytes']:
+        log('Umbral no alcanzado: %s < %s' % (format_size(dirty), prefs['size_label']))
+        return False
+
+    if _threshold_recently_ran():
+        log('Limpieza por umbral omitida: cooldown activo')
+        return False
+
+    log('Umbral superado (%s >= %s). Iniciando limpieza automática' % (format_size(dirty), prefs['size_label']))
+    try:
+        xbmcgui.Dialog().notification(
+            addon_name,
+            'Limpieza automática: se superó %s' % prefs['size_label'],
+            time=4000,
+        )
+    except Exception:
+        pass
+
+    scope = '0' if cache_temp_only else prefs['scope']
+    removed_count = 0
+    removed_size = 0
+    ok = True
+    try:
+        if scope == '2':
+            result = clean_all(interactive=False, notify=False, source='threshold')
+            return bool(result.get('ok'))
+        removed_count, removed_size = _clean_cache_dirs()
+        temp_count, temp_size = safe_remove_folder_contents(get_kodi_paths().get('temp', ''))
+        removed_count += temp_count
+        removed_size += temp_size
+        if scope == '1':
+            thumb_count, thumb_size = safe_remove_folder_contents(get_kodi_paths().get('thumbnails', ''))
+            removed_count += thumb_count
+            removed_size += thumb_size
+            clean_textures_database()
+    except Exception as error:
+        ok = False
+        log('Error en limpieza por umbral: %s' % str(error))
+
+    leftover = leftover_for_kind('umbral')
+    record_clean_event(
+        'umbral',
+        removed_count=removed_count,
+        removed_size=removed_size,
+        leftover=leftover,
+        source=source,
+        ok=ok,
+    )
+    _mark_threshold_ran()
+    try:
+        xbmcgui.Dialog().notification(
+            addon_name,
+            'Limpieza automática: %s liberados' % format_size(removed_size),
+            time=4000,
+        )
+    except Exception:
+        pass
+    return ok
+
+
 def _safe_int(value, default=0):
     """Convierte de forma segura a int desde distintos tipos/strings."""
     try:
@@ -135,33 +565,103 @@ def count_files_in_folder(folder_path):
         log('Error contando archivos en %s: %s' % (folder_path, str(e)))
     return count
 
+def _delete_file(file_path):
+    """Borra un archivo o enlace y comprueba que ya no existe."""
+    try:
+        size = os.path.getsize(file_path)
+    except Exception:
+        size = 0
+
+    errors = []
+    for action in (
+        lambda: os.remove(file_path),
+        lambda: (os.chmod(file_path, 0o666), os.remove(file_path)),
+    ):
+        if not os.path.lexists(file_path):
+            return True, size
+        try:
+            action()
+        except Exception as error:
+            errors.append(str(error))
+
+    if os.path.lexists(file_path):
+        try:
+            if xbmcvfs.delete(file_path) and not os.path.lexists(file_path):
+                return True, size
+        except Exception as error:
+            errors.append(str(error))
+
+    if os.path.lexists(file_path):
+        log('No se pudo eliminar %s: %s' % (file_path, '; '.join(errors) or 'archivo todavía presente'))
+        return False, 0
+    return True, size
+
+
+def _remove_empty_dirs(folder_path):
+    """Elimina directorios vacíos y enlaces internos, sin borrar la carpeta raíz."""
+    try:
+        for dirpath, dirnames, filenames in os.walk(folder_path, topdown=False, followlinks=False):
+            for dirname in dirnames:
+                child = os.path.join(dirpath, dirname)
+                try:
+                    if os.path.islink(child):
+                        os.remove(child)
+                    elif os.path.isdir(child) and not os.listdir(child):
+                        os.rmdir(child)
+                except Exception as error:
+                    log('No se pudo eliminar el directorio %s: %s' % (child, str(error)))
+    except Exception as error:
+        log('Error limpiando directorios vacíos en %s: %s' % (folder_path, str(error)))
+
+
 def safe_remove_folder_contents(folder_path):
-    """Elimina el contenido de una carpeta de forma segura"""
+    """Elimina el contenido de una carpeta archivo a archivo y comprueba el resultado."""
     removed_count = 0
     removed_size = 0
+    if not folder_path or not os.path.lexists(folder_path):
+        return removed_count, removed_size
+
+    real_root = os.path.realpath(folder_path)
+    protected_roots = []
+    for special in ('special://userdata', 'special://database', 'special://home', 'special://profile', 'special://masterprofile'):
+        translated = _translate(special)
+        if translated:
+            protected_roots.append(os.path.normcase(os.path.realpath(translated)))
+    if os.path.normcase(real_root) in protected_roots:
+        log('Se omite la limpieza de %s porque apunta a una carpeta protegida de Kodi' % folder_path)
+        return removed_count, removed_size
+
+    def purge_once():
+        nonlocal removed_count, removed_size
+        for dirpath, dirnames, filenames in os.walk(folder_path, followlinks=False):
+            link_names = [name for name in dirnames if os.path.islink(os.path.join(dirpath, name))]
+            for dirname in link_names:
+                deleted, size = _delete_file(os.path.join(dirpath, dirname))
+                if deleted:
+                    removed_count += 1
+                    removed_size += size
+            dirnames[:] = [name for name in dirnames if name not in link_names]
+            for filename in filenames:
+                file_path = os.path.join(dirpath, filename)
+                deleted, size = _delete_file(file_path)
+                if deleted:
+                    removed_count += 1
+                    removed_size += size
+        _remove_empty_dirs(folder_path)
+
     try:
-        if os.path.exists(folder_path):
-            for item in os.listdir(folder_path):
-                item_path = os.path.join(folder_path, item)
-                try:
-                    if os.path.isfile(item_path):
-                        size = os.path.getsize(item_path)
-                        os.remove(item_path)
-                        removed_size += size
-                        removed_count += 1
-                    elif os.path.isdir(item_path):
-                        # Contar archivos dentro del directorio antes de eliminarlo
-                        dir_file_count = count_files_in_folder(item_path)
-                        size = get_folder_size(item_path)
-                        shutil.rmtree(item_path)
-                        removed_size += size
-                        removed_count += dir_file_count  # Contar archivos reales, no directorios
-                except Exception as e:
-                    log('Error eliminando %s: %s' % (item_path, str(e)))
-                    continue
-    except Exception as e:
-        log('Error accediendo a carpeta %s: %s' % (folder_path, str(e)))
-    
+        purge_once()
+        if count_files_in_folder(folder_path):
+            log('Quedan archivos en %s; se reintenta la limpieza' % folder_path)
+            purge_once()
+    except Exception as error:
+        log('Error accediendo a carpeta %s: %s' % (folder_path, str(error)))
+
+    remaining = count_files_in_folder(folder_path)
+    if remaining:
+        log('Tras la limpieza quedan %d archivos en %s' % (remaining, folder_path))
+    else:
+        log('Carpeta vaciada: %s (%d archivos, %s)' % (folder_path, removed_count, format_size(removed_size)))
     return removed_count, removed_size
 
 def _translate(path):
@@ -185,10 +685,12 @@ def get_kodi_paths():
     try:
         # Obtener ruta de datos de usuario de Kodi (perfil)
         kodi_data_path = _translate('special://userdata/')
+        thumbnails_path = _translate('special://thumbnails/') or os.path.join(kodi_data_path, 'Thumbnails')
         
         paths = {
             'cache': os.path.join(kodi_data_path, 'cache'),
-            'thumbnails': os.path.join(kodi_data_path, 'Thumbnails'),
+            'home_cache': os.path.join(_translate('special://home/'), 'cache'),
+            'thumbnails': thumbnails_path,
             # Paquetes están fuera de userdata normalmente
             'packages': os.path.join(_translate('special://home/'), 'addons', 'packages'),
             # Ruta real de temp debe venir de special://temp/
@@ -202,17 +704,30 @@ def get_kodi_paths():
         log('Error obteniendo rutas de Kodi: %s' % str(e))
         return {}
 
+def _cache_dirs():
+    """Devuelve las carpetas de caché existentes, sin duplicar la misma ruta."""
+    paths = get_kodi_paths()
+    found = []
+    seen = set()
+    for key in ('cache', 'home_cache'):
+        path = paths.get(key, '')
+        if not path or not os.path.isdir(path):
+            continue
+        normalized = os.path.normcase(os.path.normpath(os.path.realpath(path)))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        found.append(path)
+    return found
+
+
 def get_cache_info():
     """Obtiene información de caché"""
-    paths = get_kodi_paths()
-    cache_path = paths.get('cache', '')
-    
-    if not os.path.exists(cache_path):
-        return 0, 0
-    
-    size = get_folder_size(cache_path)
-    files = count_files_in_folder(cache_path)
-    
+    size = 0
+    files = 0
+    for cache_path in _cache_dirs():
+        size += get_folder_size(cache_path)
+        files += count_files_in_folder(cache_path)
     return size, files
 
 def get_thumbnails_info():
@@ -297,7 +812,10 @@ def _collect_streaming_artifact_targets():
             for name in os.listdir(db_dir):
                 lower_name = name.lower()
                 if name.endswith('.db') and lower_name.startswith(STREAMING_DB_PREFIXES):
-                    add_target(os.path.join(db_dir, name))
+                    db_path = os.path.join(db_dir, name)
+                    add_target(db_path)
+                    for suffix in ('-wal', '-shm', '-journal'):
+                        add_target(db_path + suffix)
     except Exception as e:
         log('Error localizando bases de datos IPTV/PVR: %s' % str(e))
 
@@ -352,7 +870,7 @@ def _clean_target_paths(targets):
     return removed_count, removed_size
 
 
-def clean_streaming_artifacts(interactive=True, notify=True):
+def clean_streaming_artifacts(interactive=True, notify=True, record=True):
     """Limpia residuos persistentes de IPTV/PVR que suelen interferir con listas M3U y EPG."""
     try:
         log('Iniciando limpieza específica de streaming/IPTV')
@@ -396,12 +914,17 @@ def clean_streaming_artifacts(interactive=True, notify=True):
                          )
             xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
 
+        leftover = leftover_for_kind('streaming')
+        if record:
+            record_clean_event('streaming', removed_count, removed_size, leftover=leftover, source='manual', ok=True)
         log('Limpieza streaming/IPTV: %d archivos, %s liberados' % (removed_count, format_size(removed_size)))
         return {'removed_count': removed_count, 'removed_size': removed_size}
     except Exception as e:
         log('Error en limpieza streaming/IPTV: %s' % str(e))
         if notify:
             xbmcgui.Dialog().ok('Error', 'Error limpiando residuos de streaming/IPTV: %s' % str(e))
+        if record:
+            record_clean_event('streaming', 0, 0, leftover=leftover_for_kind('streaming'), source='manual', ok=False)
         return {'removed_count': 0, 'removed_size': 0}
 
 def get_default_kodi_values():
@@ -442,17 +965,16 @@ def clean_cache():
     """Limpia la caché de Kodi"""
     try:
         log('Iniciando limpieza de caché')
-        paths = get_kodi_paths()
-        cache_path = paths.get('cache', '')
+        cache_dirs = _cache_dirs()
         
-        if not os.path.exists(cache_path):
+        if not cache_dirs:
             xbmcgui.Dialog().ok('Información', 'No se encontró carpeta de caché.')
             return
         
         # Obtener información antes de limpiar
         size, files = get_cache_info()
         
-        if size == 0:
+        if size == 0 and files == 0:
             xbmcgui.Dialog().ok('Información', 'La caché ya está vacía.')
             return
         
@@ -471,7 +993,12 @@ def clean_cache():
         progress.update(0)
         
         # Limpiar caché
-        removed_count, removed_size = safe_remove_folder_contents(cache_path)
+        removed_count = 0
+        removed_size = 0
+        for cache_path in cache_dirs:
+            count, size_removed = safe_remove_folder_contents(cache_path)
+            removed_count += count
+            removed_size += size_removed
         
         progress.update(100, 'Limpieza completada')
         xbmc.sleep(1000)
@@ -484,11 +1011,44 @@ def clean_cache():
                      'Operación completada.') % (removed_count, format_size(removed_size))
         
         xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
+        leftover = leftover_for_kind('cache')
+        record_clean_event('cache', removed_count, removed_size, leftover=leftover, source='manual', ok=True)
         log('Caché limpiada: %d archivos, %s liberados' % (removed_count, format_size(removed_size)))
         
     except Exception as e:
         log('Error limpiando caché: %s' % str(e))
         xbmcgui.Dialog().ok('Error', 'Error limpiando caché: %s' % str(e))
+
+def _purge_textures_via_jsonrpc():
+    """Borra las texturas desde Kodi cuando la base de datos está bloqueada."""
+    try:
+        raw = xbmc.executeJSONRPC(
+            '{"jsonrpc":"2.0","id":1,"method":"Textures.GetTextures","params":{"properties":["url"]}}'
+        )
+        data = json.loads(raw or '{}')
+        textures = data.get('result', {}).get('textures') or []
+        if not textures:
+            log('No hay texturas registradas para eliminar')
+            return True
+
+        removed = 0
+        for texture in textures:
+            texture_id = texture.get('textureid')
+            if texture_id is None:
+                continue
+            xbmc.executeJSONRPC(json.dumps({
+                'jsonrpc': '2.0',
+                'id': 1,
+                'method': 'Textures.RemoveTexture',
+                'params': {'textureid': int(texture_id)},
+            }))
+            removed += 1
+        log('Texturas eliminadas por JSON-RPC: %d' % removed)
+        return removed > 0
+    except Exception as e:
+        log('Error limpiando texturas por JSON-RPC: %s' % str(e))
+        return False
+
 
 def clean_textures_database():
     """Limpia la base de datos de texturas (thumbnails)"""
@@ -509,23 +1069,22 @@ def clean_textures_database():
             log('No se encontró base de datos Textures')
             return False
         
-        try:
-            log('Limpiando base de datos: %s' % textures_db)
-            conn = sqlite3.connect(textures_db)
-            
-            # Eliminar todas las entradas de texture
-            conn.execute('DELETE FROM texture')
-            conn.commit()
-            
-            # Compactar la base de datos
-            conn.execute('VACUUM')
-            conn.close()
-            
-            log('Base de datos Textures limpiada correctamente')
-            return True
-        except Exception as e:
-            log('Error limpiando base de datos Textures: %s' % str(e))
-            return False
+        last_error = None
+        for attempt in range(3):
+            try:
+                log('Limpiando base de datos: %s (intento %d)' % (textures_db, attempt + 1))
+                conn = sqlite3.connect(textures_db, timeout=15)
+                conn.execute('DELETE FROM texture')
+                conn.commit()
+                conn.execute('VACUUM')
+                conn.close()
+                log('Base de datos Textures limpiada correctamente')
+                return True
+            except Exception as e:
+                last_error = e
+                xbmc.sleep(400)
+        log('Error limpiando base de datos Textures: %s' % str(last_error))
+        return _purge_textures_via_jsonrpc()
             
     except Exception as e:
         log('Error en clean_textures_database: %s' % str(e))
@@ -545,7 +1104,7 @@ def clean_thumbnails():
         # Obtener información antes de limpiar
         size, files = get_thumbnails_info()
         
-        if size == 0:
+        if size == 0 and files == 0:
             xbmcgui.Dialog().ok('Información', 'Los thumbnails ya están vacíos.')
             return
         
@@ -584,6 +1143,8 @@ def clean_thumbnails():
                      'Operación completada.') % (removed_count, format_size(removed_size), db_msg)
         
         xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
+        leftover = leftover_for_kind('thumbnails')
+        record_clean_event('thumbnails', removed_count, removed_size, leftover=leftover, source='manual', ok=bool(db_cleaned))
         log('Thumbnails limpiados: %d archivos, %s liberados, DB: %s' % (removed_count, format_size(removed_size), 'OK' if db_cleaned else 'FALLO'))
         
     except Exception as e:
@@ -604,7 +1165,7 @@ def clean_packages():
         # Obtener información antes de limpiar
         size, files = get_packages_info()
         
-        if size == 0:
+        if size == 0 and files == 0:
             xbmcgui.Dialog().ok('Información', 'No hay paquetes para eliminar.')
             return
         
@@ -636,6 +1197,8 @@ def clean_packages():
                      'Operación completada.') % (removed_count, format_size(removed_size))
         
         xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
+        leftover = leftover_for_kind('packages')
+        record_clean_event('packages', removed_count, removed_size, leftover=leftover, source='manual', ok=True)
         log('Paquetes limpiados: %d archivos, %s liberados' % (removed_count, format_size(removed_size)))
         
     except Exception as e:
@@ -662,7 +1225,7 @@ def clean_temp():
         # Obtener información antes de limpiar
         size, files = get_temp_info()
         
-        if size == 0:
+        if size == 0 and files == 0:
             xbmcgui.Dialog().ok('Información', 'No hay archivos temporales para eliminar.')
             return
         
@@ -695,13 +1258,15 @@ def clean_temp():
                      'Operación completada.') % (removed_count, format_size(removed_size))
         
         xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
+        leftover = leftover_for_kind('temp')
+        record_clean_event('temp', removed_count, removed_size, leftover=leftover, source='manual', ok=True)
         log('Temporales limpiados: %d archivos, %s liberados' % (removed_count, format_size(removed_size)))
         
     except Exception as e:
         log('Error limpiando archivos temporales: %s' % str(e))
         xbmcgui.Dialog().ok('Error', 'Error limpiando temporales: %s' % str(e))
 
-def clean_all(interactive=True, notify=True):
+def clean_all(interactive=True, notify=True, source='manual'):
     """Limpia todo: caché, thumbnails, paquetes, temporales y residuos IPTV/PVR."""
     try:
         log('Iniciando limpieza completa')
@@ -717,10 +1282,13 @@ def clean_all(interactive=True, notify=True):
         total_size = cache_size + thumb_size + pack_size + temp_size + streaming_size
         total_files = cache_files + thumb_files + pack_files + temp_files + streaming_files
 
-        if total_size == 0:
+        if total_size == 0 and total_files == 0:
+            clean_textures_database()
+            leftover = leftover_for_kind('completa')
+            record_clean_event('completa', 0, 0, leftover=leftover, source=source, ok=True)
             if notify:
                 xbmcgui.Dialog().ok('Información', 'No hay archivos para limpiar.')
-            return {'removed_count': 0, 'removed_size': 0}
+            return {'ok': True, 'removed_count': 0, 'removed_size': 0}
 
         # Mostrar resumen antes de limpiar
         summary = ('Resumen de limpieza completa:\n\n'
@@ -740,7 +1308,7 @@ def clean_all(interactive=True, notify=True):
 
         if interactive:
             if not xbmcgui.Dialog().yesno('Limpieza Completa', summary, yeslabel='Limpiar Todo', nolabel='Cancelar'):
-                return {'removed_count': 0, 'removed_size': 0}
+                return {'ok': False, 'removed_count': 0, 'removed_size': 0}
 
         # Mostrar progreso
         progress = None
@@ -757,39 +1325,39 @@ def clean_all(interactive=True, notify=True):
         
         # Limpiar caché
         update_progress(10, 'Limpiando caché...')
-        if cache_size > 0:
-            removed_count, removed_size = safe_remove_folder_contents(paths.get('cache', ''))
-            total_removed_count += removed_count
-            total_removed_size += removed_size
+        if cache_files or cache_size:
+            for cache_path in _cache_dirs():
+                removed_count, removed_size = safe_remove_folder_contents(cache_path)
+                total_removed_count += removed_count
+                total_removed_size += removed_size
         
         # Limpiar thumbnails
         update_progress(35, 'Limpiando thumbnails...')
-        if thumb_size > 0:
+        if thumb_files or thumb_size:
             removed_count, removed_size = safe_remove_folder_contents(paths.get('thumbnails', ''))
             total_removed_count += removed_count
             total_removed_size += removed_size
-            
-            # Limpiar base de datos de Textures
-            update_progress(45, 'Limpiando base de datos de texturas...')
-            clean_textures_database()
+
+        update_progress(45, 'Limpiando base de datos de texturas...')
+        clean_textures_database()
 
         # Limpiar residuos persistentes de IPTV/PVR
         update_progress(60, 'Limpiando residuos de streaming/IPTV...')
-        if streaming_size > 0:
-            stream_result = clean_streaming_artifacts(interactive=False, notify=False)
+        if streaming_files or streaming_size:
+            stream_result = clean_streaming_artifacts(interactive=False, notify=False, record=False)
             total_removed_count += stream_result.get('removed_count', 0)
             total_removed_size += stream_result.get('removed_size', 0)
         
         # Limpiar paquetes
         update_progress(78, 'Limpiando paquetes...')
-        if pack_size > 0:
+        if pack_files or pack_size:
             removed_count, removed_size = safe_remove_folder_contents(paths.get('packages', ''))
             total_removed_count += removed_count
             total_removed_size += removed_size
         
         # Limpiar temporales
         update_progress(92, 'Limpiando archivos temporales...')
-        if temp_size > 0:
+        if temp_files or temp_size:
             removed_count, removed_size = safe_remove_folder_contents(paths.get('temp', ''))
             total_removed_count += removed_count
             total_removed_size += removed_size
@@ -805,108 +1373,119 @@ def clean_all(interactive=True, notify=True):
                      'Total espacio liberado: %s\n\n'
                      '¡Kodi está más limpio!') % (total_removed_count, format_size(total_removed_size))
 
+        leftover = leftover_for_kind('completa')
+        record_clean_event(
+            'completa',
+            total_removed_count,
+            total_removed_size,
+            leftover=leftover,
+            source=source,
+            ok=True,
+        )
+        if source == 'threshold':
+            _mark_threshold_ran()
         if notify:
             xbmcgui.Dialog().ok('Limpieza Completada', result_msg)
         log('Limpieza completa: %d archivos, %s liberados' % (total_removed_count, format_size(total_removed_size)))
-        return {'removed_count': total_removed_count, 'removed_size': total_removed_size}
+        return {'ok': True, 'removed_count': total_removed_count, 'removed_size': total_removed_size}
     except Exception as e:
         log('Error en limpieza completa: %s' % str(e))
+        record_clean_event('completa', 0, 0, leftover=leftover_for_kind('completa'), source=source, ok=False)
         if notify:
             xbmcgui.Dialog().ok('Error', 'Error en limpieza completa: %s' % str(e))
-        return {'removed_count': 0, 'removed_size': 0}
+        return {'ok': False, 'removed_count': 0, 'removed_size': 0}
+
+def _disable_scheduled_clean(dialog=None):
+    schedule_path = os.path.join(addon_data_dir, 'schedule_clean.json')
+    try:
+        if os.path.exists(schedule_path):
+            os.remove(schedule_path)
+    except Exception as error:
+        log('No se pudo desactivar la limpieza programada: %s' % str(error))
+        if dialog:
+            dialog.ok('Error', 'No se pudo desactivar la limpieza programada: %s' % str(error))
+        return False
+    log('Limpieza programada desactivada')
+    if dialog:
+        dialog.ok('Limpieza al inicio', 'Limpieza programada desactivada.')
+    return True
+
 
 def schedule_clean_on_start():
-    """Programa limpieza al inicio: una vez o en cada inicio; también permite desactivar."""
+    """Programa limpieza al inicio: una vez, en cada inicio, o desactivar."""
     try:
         log('Preparando programación de limpieza al iniciar')
-        # Obtener información actual
         cache_size, cache_files = get_cache_info()
         thumb_size, thumb_files = get_thumbnails_info()
         pack_size, pack_files = get_packages_info()
         temp_size, temp_files = get_temp_info()
         streaming_size, streaming_files = get_streaming_artifacts_info()
-
         total_size = cache_size + thumb_size + pack_size + temp_size + streaming_size
         total_files = cache_files + thumb_files + pack_files + temp_files + streaming_files
-
+        schedule = get_schedule_status()
         dialog = xbmcgui.Dialog()
-        # Opción para desactivar incluso si no hay nada que limpiar ahora
-        if total_size == 0:
-            choice = dialog.select('Limpieza al inicio', [
-                'Desactivar limpieza al iniciar',
-                'Cancelar'
-            ])
-            if choice == 0:
-                try:
-                    os.remove(os.path.join(addon_data_dir, 'schedule_clean.json'))
-                except Exception:
-                    pass
-                dialog.ok('Limpieza al inicio', 'Limpieza programada desactivada.')
-            return
 
-        # Resumen y opciones de programación
-        summary = (
-            'Resumen estimado:\n\n'
-            '- Caché: %d archivos (%s)\n'
-            '- Thumbnails: %d archivos (%s)\n'
-            '- Paquetes: %d archivos (%s)\n'
-            '- Temporales: %d archivos (%s)\n'
-            '- Streaming/IPTV: %d archivos (%s)\n\n'
-            'TOTAL: %d archivos (%s)\n\n'
-            'Elige el modo:'
-        ) % (
-            cache_files, format_size(cache_size),
-            thumb_files, format_size(thumb_size),
-            pack_files, format_size(pack_size),
-            temp_files, format_size(temp_size),
-            streaming_files, format_size(streaming_size),
-            total_files, format_size(total_size)
+        if schedule.get('active'):
+            current = 'activa (%s)' % (
+                'en cada inicio' if schedule.get('repeat') else 'próximo inicio'
+            )
+        else:
+            current = 'desactivada'
+
+        choice = dialog.select(
+            'Programar limpieza al iniciar',
+            [
+                'Ejecutar en el próximo inicio (una vez)',
+                'Ejecutar en cada inicio (persistente)',
+                'Desactivar limpieza al iniciar',
+                'Cancelar',
+            ],
         )
-        choice = dialog.select('Programar limpieza al iniciar', [
-            'Ejecutar en el próximo inicio (una vez)',
-            'Ejecutar en cada inicio (persistente)',
-            'Desactivar limpieza al iniciar',
-            'Cancelar'
-        ], useDetails=True)
         if choice in (-1, 3):
-            log('Usuario canceló programación')
+            log('Usuario canceló programación (estado actual: %s)' % current)
             return
         if choice == 2:
-            try:
-                os.remove(os.path.join(addon_data_dir, 'schedule_clean.json'))
-            except Exception:
-                pass
-            dialog.ok('Limpieza al inicio', 'Limpieza programada desactivada.')
+            _disable_scheduled_clean(dialog)
             return
 
-        # Guardar marca en addon_data_dir
         schedule_path = os.path.join(addon_data_dir, 'schedule_clean.json')
         data = {
             'scheduled': True,
             'repeat': (choice == 1),
-            'created': __import__('datetime').datetime.now().isoformat(),
+            'created': datetime.datetime.now().isoformat(timespec='seconds'),
             'planned': {
                 'cache': {'files': cache_files, 'size': cache_size},
                 'thumbnails': {'files': thumb_files, 'size': thumb_size},
                 'packages': {'files': pack_files, 'size': pack_size},
                 'temp': {'files': temp_files, 'size': temp_size},
                 'streaming': {'files': streaming_files, 'size': streaming_size},
-                'total': {'files': total_files, 'size': total_size}
+                'total': {'files': total_files, 'size': total_size},
             },
-            'summary': summary
         }
         try:
             os.makedirs(addon_data_dir, exist_ok=True)
-            with open(schedule_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            log('Limpieza programada (%s). Archivo: %s' % ('persistente' if data['repeat'] else 'una vez', schedule_path))
-            dialog.ok('Limpieza programada', 'Se ejecutará %s.' % ('en cada inicio' if data['repeat'] else 'en el próximo inicio'))
-        except Exception as e:
-            log('No se pudo programar la limpieza: %s' % str(e))
-            dialog.ok('Error', 'No se pudo programar la limpieza: %s' % str(e))
-    except Exception as e:
-        log('Error programando limpieza al iniciar: %s' % str(e))
-        xbmcgui.Dialog().ok('Error', 'Error programando limpieza: %s' % str(e))
+            with open(schedule_path, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+            mode = 'en cada inicio' if data['repeat'] else 'en el próximo inicio'
+            log('Limpieza programada (%s). Archivo: %s' % (mode, schedule_path))
+            dialog.ok(
+                'Limpieza programada',
+                'Estado anterior: %s\n'
+                'Residuos ahora: %d archivos (%s)\n\n'
+                'Se ejecutará %s.\n'
+                'Al arrancar limpiará lo que haya en ese momento.' % (
+                    current,
+                    total_files,
+                    format_size(total_size),
+                    mode,
+                ),
+            )
+        except Exception as error:
+            log('No se pudo programar la limpieza: %s' % str(error))
+            dialog.ok('Error', 'No se pudo programar la limpieza: %s' % str(error))
+    except Exception as error:
+        log('Error programando limpieza al iniciar: %s' % str(error))
+        xbmcgui.Dialog().ok('Error', 'Error programando limpieza: %s' % str(error))
 
 def manage_buffering():
     """Gestión de buffering con menús agrupados por categorías"""
@@ -1060,6 +1639,7 @@ def manage_buffering():
             def submenu_timeshift():
                 while True:
                     opciones = [
+                        'Comprobar / reparar IPTV Simple',
                         'Abrir ajustes de Timeshift (PVR & TV en directo)',
                         'Volver'
                     ]
@@ -1067,6 +1647,8 @@ def manage_buffering():
                     if i in (-1, len(opciones)-1):
                         break
                     if i == 0:
+                        check_and_fix_iptv_simple()
+                    elif i == 1:
                         open_timeshift_settings()
 
             def submenu_video_optimizations():
@@ -1180,21 +1762,6 @@ def detect_network_type():
     except:
         pass
     return 'Desconocido'
-
-def recommend_buffer_size(ram_bytes, is_android=False):
-    """Recomienda tamaño de buffer según RAM disponible"""
-    # Usar entre 5-10% de la RAM, con límites
-    recommended = ram_bytes // 16  # ~6.25% de RAM
-    
-    # Aplicar límites
-    if is_android:
-        # Android: más conservador
-        recommended = min(max(recommended, 20*1024*1024), 100*1024*1024)  # 20MB-100MB
-    else:
-        # Otros sistemas
-        recommended = min(max(recommended, 30*1024*1024), 200*1024*1024)  # 30MB-200MB
-    
-    return recommended
 
 def configure_basic_buffering(config_path):
     """Proxy a buffering.py para mantener una única implementación."""
@@ -1656,101 +2223,291 @@ def test_special_temp_cache_write():
         log('Error en test_special_temp_cache_write: %s' % str(e))
         xbmcgui.Dialog().ok('Error', 'Error en prueba de temp/cache: %s' % str(e))
 
+def _pvr_addon_id():
+    return 'pvr.iptvsimple'
+
+
+def _has_addon_installed(addon_id):
+    try:
+        xbmcaddon.Addon(addon_id)
+        return True
+    except Exception:
+        return False
+
+
+def _is_addon_enabled(addon_id):
+    try:
+        return bool(xbmc.getCondVisibility('System.HasAddon(%s)' % addon_id))
+    except Exception:
+        return False
+
+
+def _get_addon_details(addon_id):
+    """Devuelve detalles del addon vía JSON-RPC."""
+    try:
+        raw = xbmc.executeJSONRPC(json.dumps({
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'Addons.GetAddonDetails',
+            'params': {
+                'addonid': addon_id,
+                'properties': ['name', 'version', 'enabled', 'installed', 'broken'],
+            },
+        }))
+        data = json.loads(raw or '{}')
+        return data.get('result', {}).get('addon') or {}
+    except Exception as error:
+        log('No se pudieron leer detalles de %s: %s' % (addon_id, str(error)))
+        return {}
+
+
+def _set_addon_enabled(addon_id, enabled=True):
+    try:
+        xbmc.executeJSONRPC(json.dumps({
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'Addons.SetAddonEnabled',
+            'params': {'addonid': addon_id, 'enabled': bool(enabled)},
+        }))
+        xbmc.sleep(800)
+        return _is_addon_enabled(addon_id) if enabled else (not _is_addon_enabled(addon_id))
+    except Exception:
+        try:
+            xbmc.executebuiltin('%s(%s)' % ('EnableAddon' if enabled else 'DisableAddon', addon_id))
+            xbmc.sleep(800)
+            return _is_addon_enabled(addon_id) if enabled else True
+        except Exception as error:
+            log('No se pudo %s %s: %s' % ('habilitar' if enabled else 'deshabilitar', addon_id, str(error)))
+            return False
+
+
+def _install_pvr_iptvsimple(timeout_seconds=45):
+    """Instala pvr.iptvsimple y espera a que aparezca."""
+    dialog = xbmcgui.Dialog()
+    dialog.notification(addon_name, 'Instalando IPTV Simple Client...', time=3000)
+    log('Instalando pvr.iptvsimple')
+    try:
+        xbmc.executebuiltin('InstallAddon(%s)' % _pvr_addon_id())
+    except Exception as error:
+        log('InstallAddon falló: %s' % str(error))
+
+    steps = max(1, int(timeout_seconds * 2))
+    for step in range(steps):
+        xbmc.sleep(500)
+        if _has_addon_installed(_pvr_addon_id()):
+            _set_addon_enabled(_pvr_addon_id(), True)
+            log('pvr.iptvsimple instalado correctamente')
+            return True
+        if step in (20, 40, 60):
+            dialog.notification(addon_name, 'Instalando IPTV Simple... espera', time=2000)
+
+    # Fallback: abrir el buscador para instalación manual
+    try:
+        xbmc.executebuiltin('ActivateWindow(addonbrowser,addons://search/pvr.iptvsimple/,return)')
+    except Exception:
+        pass
+    return _has_addon_installed(_pvr_addon_id())
+
+
+def _pvr_channels_loaded():
+    """Comprueba si el cliente PVR ha cargado canales de TV o radio."""
+    try:
+        has_tv = bool(xbmc.getCondVisibility('PVR.HasTVChannels'))
+    except Exception:
+        has_tv = False
+    try:
+        has_radio = bool(xbmc.getCondVisibility('PVR.HasRadioChannels'))
+    except Exception:
+        has_radio = False
+    return has_tv, has_radio
+
+
+def _wait_for_pvr_channels(timeout_seconds=25):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        has_tv, has_radio = _pvr_channels_loaded()
+        if has_tv or has_radio:
+            return has_tv, has_radio
+        xbmc.sleep(1000)
+    return _pvr_channels_loaded()
+
+
+def check_and_fix_iptv_simple():
+    """Comprueba IPTV Simple: instalación, habilitado y carga de canales; repara si hace falta."""
+    try:
+        dialog = xbmcgui.Dialog()
+        pvr_id = _pvr_addon_id()
+        actions = []
+        progress = xbmcgui.DialogProgress()
+        progress.create('IPTV Simple Client', 'Comprobando estado...')
+
+        # 1) Instalado
+        progress.update(10, 'Comprobando si está instalado...')
+        installed = _has_addon_installed(pvr_id)
+        if not installed:
+            progress.close()
+            if not dialog.yesno(
+                'IPTV Simple Client',
+                'No está instalado.\n\n¿Instalarlo automáticamente desde el repositorio de Kodi?',
+                yeslabel='Instalar',
+                nolabel='Cancelar',
+            ):
+                return
+            progress = xbmcgui.DialogProgress()
+            progress.create('IPTV Simple Client', 'Instalando...')
+            installed = _install_pvr_iptvsimple()
+            actions.append('Instalación: %s' % ('OK' if installed else 'falló'))
+            if not installed:
+                progress.close()
+                dialog.ok(
+                    'IPTV Simple Client',
+                    'No se pudo instalar automáticamente.\n\n'
+                    'Se abrió el buscador de addons.\n'
+                    'Busca "IPTV Simple Client" e instálalo a mano.',
+                )
+                return
+
+        # 2) Detalles / broken
+        progress.update(35, 'Leyendo detalles del addon...')
+        details = _get_addon_details(pvr_id)
+        name = details.get('name') or 'PVR IPTV Simple Client'
+        version = details.get('version') or '?'
+        broken = str(details.get('broken') or '').strip()
+        if broken and broken.lower() not in ('false', '0', 'none'):
+            actions.append('Marcado como roto: %s' % broken)
+
+        # 3) Habilitado
+        progress.update(55, 'Comprobando si está habilitado...')
+        enabled = _is_addon_enabled(pvr_id)
+        if not enabled:
+            progress.update(60, 'Habilitando IPTV Simple...')
+            enabled = _set_addon_enabled(pvr_id, True)
+            actions.append('Habilitación: %s' % ('OK' if enabled else 'falló'))
+            try:
+                xbmc.executebuiltin('UpdateLocalAddons')
+            except Exception:
+                pass
+            xbmc.sleep(1500)
+
+        # 4) Carga de canales
+        progress.update(75, 'Comprobando carga de canales PVR...')
+        has_tv, has_radio = _wait_for_pvr_channels(timeout_seconds=20)
+        channels_ok = bool(has_tv or has_radio)
+        progress.update(100, 'Listo')
+        xbmc.sleep(300)
+        progress.close()
+
+        lines = [
+            'RESULTADO IPTV SIMPLE',
+            '=' * 36,
+            '',
+            'Addon: %s' % name,
+            'ID: %s' % pvr_id,
+            'Versión: %s' % version,
+            'Instalado: %s' % ('sí' if installed else 'no'),
+            'Habilitado: %s' % ('sí' if enabled else 'no'),
+            'Canales TV: %s' % ('sí' if has_tv else 'no'),
+            'Canales radio: %s' % ('sí' if has_radio else 'no'),
+        ]
+        if broken and broken.lower() not in ('false', '0', 'none'):
+            lines.append('Estado roto: %s' % broken)
+        if actions:
+            lines.extend(['', 'Acciones realizadas:'] + ['- %s' % item for item in actions])
+
+        if installed and enabled and channels_ok:
+            lines.extend(['', 'Estado: funciona correctamente y carga canales.'])
+            dialog.textviewer('IPTV Simple Client', '\n'.join(lines))
+            return
+
+        if installed and enabled and not channels_ok:
+            lines.extend([
+                '',
+                'Estado: el cliente está instalado y activo,',
+                'pero no hay canales cargados.',
+                '',
+                'Suele faltar la lista M3U/EPG en su configuración.',
+            ])
+            dialog.textviewer('IPTV Simple Client', '\n'.join(lines))
+            if dialog.yesno(
+                'IPTV Simple Client',
+                'No se detectaron canales.\n\n¿Abrir la configuración de IPTV Simple para revisar la lista M3U?',
+                yeslabel='Abrir ajustes',
+                nolabel='Cerrar',
+            ):
+                open_timeshift_settings()
+            return
+
+        lines.extend(['', 'Estado: no funciona correctamente.'])
+        dialog.textviewer('IPTV Simple Client', '\n'.join(lines))
+        if dialog.yesno(
+            'IPTV Simple Client',
+            'El cliente no está operativo.\n\n¿Reintentar instalación/habilitación?',
+            yeslabel='Reintentar',
+            nolabel='Cerrar',
+        ):
+            if not _has_addon_installed(pvr_id):
+                _install_pvr_iptvsimple()
+            _set_addon_enabled(pvr_id, True)
+            dialog.notification(addon_name, 'Vuelve a ejecutar la comprobación tras reiniciar Kodi si hace falta', time=5000)
+    except Exception as error:
+        log('Error comprobando IPTV Simple: %s' % str(error))
+        xbmcgui.Dialog().ok('Error', 'Error comprobando IPTV Simple: %s' % str(error))
+
+
 def open_timeshift_settings():
     """Abre los ajustes de IPTV Simple (pvr.iptvsimple) con tratamiento especial en Android."""
     try:
         dialog = xbmcgui.Dialog()
-        is_android = xbmc.getCondVisibility('system.platform.android')
+        pvr_id = _pvr_addon_id()
 
-        def _has_addon(addon_id: str) -> bool:
-            try:
-                addon = xbmcaddon.Addon(addon_id)
-                return True
-            except Exception:
-                return False
-
-        def _is_addon_enabled(addon_id: str) -> bool:
-            try:
-                return xbmc.getCondVisibility('System.HasAddon(%s)' % addon_id)
-            except Exception:
-                return False
-
-        def _open_addon_settings(addon_id: str):
+        def _open_addon_settings(target_id):
             """Abre los ajustes del addon con múltiples métodos de fallback"""
             try:
-                # Método 1: Comando directo
-                xbmc.executebuiltin('Addon.OpenSettings(%s)' % addon_id)
+                xbmc.executebuiltin('Addon.OpenSettings(%s)' % target_id)
                 xbmc.sleep(500)
                 return True
             except Exception:
                 pass
-            
+
             try:
-                # Método 2: Activar ventana con parámetros
-                xbmc.executebuiltin('ActivateWindow(addonsettings,%s)' % addon_id)
+                xbmc.executebuiltin('ActivateWindow(addonsettings,%s)' % target_id)
                 xbmc.sleep(500)
                 return True
             except Exception:
                 pass
-                
+
             try:
-                # Método 3: Abrir desde browser de addons
-                xbmc.executebuiltin('ActivateWindow(addonbrowser,addons://enabled/xbmc.pvrclient/%s/,return)' % addon_id)
+                xbmc.executebuiltin('ActivateWindow(addonbrowser,addons://enabled/xbmc.pvrclient/%s/,return)' % target_id)
                 xbmc.sleep(500)
                 return True
             except Exception:
                 pass
-                
+
             return False
 
-        # Verificar si IPTV Simple está instalado
-        if not _has_addon('pvr.iptvsimple'):
-            if dialog.yesno('IPTV Simple Client',
-                             'El addon IPTV Simple Client no está instalado.\n\n'
-                             '¿Deseas instalarlo desde el repositorio?',
-                             yeslabel='Instalar', nolabel='Cancelar'):
-                try:
-                    # Intentar instalación automática
-                    xbmc.executebuiltin('InstallAddon(pvr.iptvsimple)')
-                    dialog.notification('Instalando', 'Instalando IPTV Simple Client...', time=3000)
-                    
-                    # Esperar hasta 30 segundos para que se instale
-                    for i in range(60):
-                        xbmc.sleep(500)
-                        if _has_addon('pvr.iptvsimple'):
-                            dialog.notification('Instalado', 'IPTV Simple Client instalado correctamente', time=2000)
-                            break
-                        if i == 30:  # Después de 15 segundos, mostrar progreso
-                            dialog.notification('Instalando', 'Sigue instalando... por favor espera', time=2000)
-                    else:
-                        # Si falla la instalación automática, abrir browser
-                        xbmc.executebuiltin('ActivateWindow(addonbrowser,addons://search/pvr.iptvsimple/,return)')
-                        dialog.notification('Manual', 'Busca e instala "IPTV Simple Client" manualmente', time=4000)
-                        return
-                except Exception as e:
-                    log('Error instalando IPTV Simple: %s' % str(e))
-                    xbmc.executebuiltin('ActivateWindow(addonbrowser,addons://search/pvr.iptvsimple/,return)')
-                    dialog.notification('Error', 'Instala IPTV Simple Client manualmente', time=4000)
+        if not _has_addon_installed(pvr_id):
+            if dialog.yesno(
+                'IPTV Simple Client',
+                'El addon IPTV Simple Client no está instalado.\n\n'
+                '¿Deseas instalarlo automáticamente?',
+                yeslabel='Instalar',
+                nolabel='Cancelar',
+            ):
+                if not _install_pvr_iptvsimple():
+                    dialog.notification('Manual', 'Busca e instala "IPTV Simple Client" manualmente', time=4000)
                     return
             else:
                 return
 
-        # Verificar si está habilitado
-        if not _is_addon_enabled('pvr.iptvsimple'):
-            try:
-                xbmc.executebuiltin('EnableAddon(pvr.iptvsimple)')
-                xbmc.sleep(1000)  # Dar tiempo para que se habilite
-                log('IPTV Simple Client habilitado')
-            except Exception as e:
-                log('Error habilitando IPTV Simple: %s' % str(e))
+        if not _is_addon_enabled(pvr_id):
+            _set_addon_enabled(pvr_id, True)
+            log('IPTV Simple Client habilitado')
 
-        # Intentar abrir configuración
-        success = _open_addon_settings('pvr.iptvsimple')
-        
+        success = _open_addon_settings(pvr_id)
+
         if success:
             dialog.notification('Configuración', 'Abriendo ajustes de IPTV Simple Client', time=2000)
         else:
-            # Fallback: abrir configuraciones PVR generales
             log('No se pudo abrir configuración de IPTV Simple, abriendo PVR general')
             try:
                 xbmc.executebuiltin('ActivateWindow(pvrsettings)')
@@ -1761,11 +2518,13 @@ def open_timeshift_settings():
                     xbmc.sleep(500)
                 except Exception:
                     xbmc.executebuiltin('ActivateWindow(settings)')
-                    
-            dialog.notification('Configuración PVR', 
-                              'Ve a: TV en directo → General → Cliente PVR', 
-                              time=5000)
-                              
+
+            dialog.notification(
+                'Configuración PVR',
+                'Ve a: TV en directo → General → Cliente PVR',
+                time=5000,
+            )
+
     except Exception as e:
         log('Error abriendo ajustes de Timeshift: %s' % str(e))
         xbmcgui.Dialog().notification('Error', 'No se pudieron abrir los ajustes: %s' % str(e), time=4000)
@@ -2023,7 +2782,9 @@ def restore_kodi_defaults():
                         'android_pvr_handled.flag',
                         'schedule_clean.json',
                         'usb_autoclean.json',
-                        'temp_symlink_state.json'
+                        'temp_symlink_state.json',
+                        'clean_history.json',
+                        'threshold_last.json',
                     ]
                     
                     removed_configs = 0
@@ -5113,7 +5874,7 @@ def show_about():
                     '• Compactación de bases de datos\n\n'
                     'Versión: %s\n'
                     'Por: entreunosyceros\n\n'
-                    'Repositorio: github.com/sapoclay/aspirando-kodi')
+                    'Repositorio: github.com/entreunosyceros/aspirando-kodi')
         info_text = info_text % (addon_version, addon_version)
         
         # Mostrar información completa con scroll
@@ -5121,18 +5882,18 @@ def show_about():
         
         # Preguntar si quiere abrir el repositorio
         if dialog.yesno('Repositorio GitHub', 
-                       'github.com/sapoclay/aspirando-kodi\n\n'
+                       'github.com/entreunosyceros/aspirando-kodi\n\n'
                        '¿Abrir repositorio en el navegador?',
                        yeslabel='Abrir',
                        nolabel='Cerrar'):
             try:
                 import webbrowser
-                webbrowser.open('https://github.com/sapoclay/aspirando-kodi')
+                webbrowser.open('https://github.com/entreunosyceros/aspirando-kodi')
                 log('Repositorio abierto en navegador')
             except Exception as e:
                 log('Error abriendo navegador: %s' % str(e))
                 # Mostrar URL si no se puede abrir navegador
-                dialog.ok('Repositorio', 'https://github.com/sapoclay/aspirando-kodi')
+                dialog.ok('Repositorio', 'https://github.com/entreunosyceros/aspirando-kodi')
         
     except Exception as e:
         log('Error en show_about: %s' % str(e))
@@ -5205,7 +5966,9 @@ def main():
                 'Limpieza Completa',
                 'Compactar Bases de Datos',
                 'Programar limpieza al iniciar',
+                'Estado y mantenimiento',
                 'Gestión de Buffering',
+                'Comprobar IPTV Simple',
                 'Restaurar valores predeterminados',
                 'Resetear aviso PVR Android',
                 'Buscar actualizaciones',
@@ -5216,66 +5979,72 @@ def main():
             
             seleccion = dialog.select('Aspirando Kodi - Menú Principal', opciones)
             
-            if seleccion == -1 or seleccion == 14:  # Usuario canceló o seleccionó Salir
+            if seleccion == -1 or seleccion == 16:
                 log('Usuario salió del addon')
                 break
             
-            if seleccion == 0:  # Limpiar Caché
+            if seleccion == 0:
                 log('Usuario seleccionó: Limpiar Caché')
                 clean_cache()
                 
-            elif seleccion == 1:  # Limpiar Thumbnails
+            elif seleccion == 1:
                 log('Usuario seleccionó: Limpiar Thumbnails')
                 clean_thumbnails()
                 
-            elif seleccion == 2:  # Limpiar Paquetes
+            elif seleccion == 2:
                 log('Usuario seleccionó: Limpiar Paquetes')
                 clean_packages()
                 
-            elif seleccion == 3:  # Limpiar Temporales
+            elif seleccion == 3:
                 log('Usuario seleccionó: Limpiar Temporales')
                 clean_temp()
                 
-            elif seleccion == 4:  # Limpieza Streaming/IPTV
+            elif seleccion == 4:
                 log('Usuario seleccionó: Limpieza Streaming/IPTV')
                 clean_streaming_artifacts()
 
-            elif seleccion == 5:  # Limpieza Completa
+            elif seleccion == 5:
                 log('Usuario seleccionó: Limpieza Completa')
                 clean_all()
             
-            elif seleccion == 6:  # Compactar Bases de Datos
+            elif seleccion == 6:
                 log('Usuario seleccionó: Compactar Bases de Datos')
                 vacuum_databases()
             
-            elif seleccion == 7:  # Programar limpieza al iniciar
+            elif seleccion == 7:
                 log('Usuario seleccionó: Programar limpieza al iniciar')
                 schedule_clean_on_start()
+
+            elif seleccion == 8:
+                log('Usuario seleccionó: Estado y mantenimiento')
+                show_status_and_maintenance()
                 
-            elif seleccion == 8:  # Gestión de Buffering
+            elif seleccion == 9:
                 log('Usuario seleccionó: Gestión de Buffering')
                 manage_buffering()
+
+            elif seleccion == 10:
+                log('Usuario seleccionó: Comprobar IPTV Simple')
+                check_and_fix_iptv_simple()
                 
-            elif seleccion == 9:  # Restaurar valores predeterminados
+            elif seleccion == 11:
                 log('Usuario seleccionó: Restaurar valores predeterminados')
                 restore_kodi_defaults()
                 
-            elif seleccion == 10:  # Resetear aviso PVR Android
+            elif seleccion == 12:
                 log('Usuario seleccionó: Resetear aviso PVR Android')
                 reset_android_pvr_warning()
                 
-            elif seleccion == 11:  # Buscar actualizaciones
+            elif seleccion == 13:
                 log('Usuario seleccionó: Buscar actualizaciones')
                 check_addon_updates()
 
-            elif seleccion == 12:  # Reiniciar Kodi
+            elif seleccion == 14:
                 log('Usuario seleccionó: Reiniciar Kodi')
                 restart_kodi()
-                # Si el usuario confirma reiniciar, salimos del bucle
-                # porque Kodi se va a reiniciar
                 break
                 
-            elif seleccion == 13:  # Acerca de
+            elif seleccion == 15:
                 log('Usuario seleccionó: Acerca de')
                 show_about()
                 

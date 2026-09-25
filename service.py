@@ -13,19 +13,76 @@ addon = xbmcaddon.Addon()
 addon_id = addon.getAddonInfo('id')
 addon_name = addon.getAddonInfo('name')
 
-try:
-    addon_data_dir = xbmcvfs.translatePath('special://profile/addon_data/%s' % addon_id)
-except Exception:
-    addon_data_dir = os.path.expanduser('~/.kodi/userdata/addon_data/%s' % addon_id)
-
-schedule_path = os.path.join(addon_data_dir, 'schedule_clean.json')
 _default_module = None
-KodiMonitorBase = cast(Any, getattr(xbmc, 'Monitor', object))
 KodiPlayerBase = cast(Any, getattr(xbmc, 'Player', object))
 
 
 def log(msg):
     xbmc.log('[%s][service] %s' % (addon_name, msg), xbmc.LOGINFO)
+
+
+def _translate_path(special_path):
+    try:
+        translated = xbmcvfs.translatePath(special_path)
+    except Exception:
+        translated = ''
+    if not translated or str(translated).startswith('special://'):
+        return ''
+    return translated
+
+
+def get_addon_data_dir():
+    translated = _translate_path('special://profile/addon_data/%s' % addon_id)
+    if translated:
+        return translated
+    return os.path.expanduser('~/.kodi/userdata/addon_data/%s' % addon_id)
+
+
+def get_schedule_path():
+    return os.path.join(get_addon_data_dir(), 'schedule_clean.json')
+
+
+def profile_is_ready():
+    profile = _translate_path('special://profile/')
+    userdata = _translate_path('special://userdata/')
+    return bool(profile and userdata and os.path.isdir(profile) and os.path.isdir(userdata))
+
+
+def create_monitor():
+    monitor_cls = getattr(xbmc, 'Monitor', None)
+    if monitor_cls is None:
+        class _DummyMonitor:
+            def abortRequested(self):
+                return False
+
+            def waitForAbort(self, timeout):
+                time.sleep(timeout)
+                return False
+
+        return _DummyMonitor()
+    return monitor_cls()
+
+
+def wait_until_kodi_ready(monitor, timeout=90):
+    """Espera a que el perfil de usuario esté disponible antes de buscar la limpieza."""
+    log('Esperando a que el perfil de Kodi esté listo')
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if monitor.abortRequested():
+            return False
+        if profile_is_ready():
+            if monitor.waitForAbort(3):
+                return False
+            log('Perfil de Kodi listo')
+            return True
+        if monitor.waitForAbort(0.5):
+            return False
+    ready = profile_is_ready()
+    if ready:
+        log('Perfil de Kodi listo tras el tiempo de espera')
+    else:
+        log('El perfil de Kodi no llegó a estar listo')
+    return ready
 
 
 def get_default_module():
@@ -48,11 +105,22 @@ def get_default_module():
     return mod
 
 
-def run_clean():
+def _notify(message, duration=4000):
     try:
+        xbmcgui.Dialog().notification(addon_name, message, time=duration)
+    except Exception as error:
+        log('No se pudo mostrar la notificación: %s' % str(error))
+
+
+def run_clean():
+    schedule_path = get_schedule_path()
+    try:
+        if not profile_is_ready():
+            log('Limpieza programada aplazada: el perfil todavía no está listo')
+            return False
+
         mod = get_default_module()
 
-        # Mostrar aviso previo
         try:
             with open(schedule_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -60,49 +128,72 @@ def run_clean():
         except Exception:
             planned = {}
 
-        summary_lines = [
-            'Iniciando limpieza programada...',
-            '',
-            'Se eliminarán (estimado):'
-        ]
+        summary_lines = ['Iniciando limpieza programada']
+
         def fmt(cat):
             info = planned.get(cat, {})
             files = info.get('files', 0)
             size = info.get('size', 0)
             return '%s: %d archivos (%s)' % (cat.capitalize(), files, mod.format_size(size))
+
         for c in ['cache', 'thumbnails', 'packages', 'temp', 'streaming']:
             summary_lines.append(fmt(c))
         log(' | '.join(summary_lines))
-        xbmcgui.Dialog().notification(addon_name, 'Limpieza programada iniciada', time=3000)
+        _notify('Limpieza programada iniciada', 3000)
 
-        # Ejecutar limpieza completa
-        result = mod.clean_all(interactive=False, notify=False)
-        xbmcgui.Dialog().notification(addon_name, 'Limpieza completada: %s liberados' % mod.format_size(result.get('removed_size', 0)), time=4000)
+        result = mod.clean_all(interactive=False, notify=False, source='scheduled')
+        if not isinstance(result, dict) or result.get('ok') is False:
+            log('La limpieza programada no se completó')
+            _notify('No se pudo completar la limpieza programada', 5000)
+            return False
+
+        removed_count = result.get('removed_count', 0)
+        removed_size = result.get('removed_size', 0)
+        _notify('Limpieza completada: %s liberados' % mod.format_size(removed_size), 5000)
         log('Limpieza programada ejecutada: %d archivos, %s liberados' % (
-            result.get('removed_count', 0),
-            mod.format_size(result.get('removed_size', 0))
+            removed_count,
+            mod.format_size(removed_size)
         ))
+        return True
     except Exception as e:
         log('Error en limpieza programada: %s' % str(e))
-        xbmcgui.Dialog().ok(addon_name, 'Error en limpieza programada: %s' % str(e))
-
-
-class StartupMonitor(KodiMonitorBase):
-    def __init__(self):
-        super().__init__()
-        self.started = False
-
-    def abortRequested(self):
-        return False if not hasattr(super(), 'abortRequested') else super().abortRequested()
-
-    def waitForAbort(self, timeout):
-        if hasattr(super(), 'waitForAbort'):
-            return super().waitForAbort(timeout)
-        xbmc.sleep(int(timeout * 1000))
+        _notify('Error en la limpieza programada', 5000)
         return False
 
-    def onSettingsChanged(self):
-        pass
+
+def maybe_run_scheduled_clean():
+    schedule_path = get_schedule_path()
+    log('Buscando limpieza programada en %s' % schedule_path)
+    if not os.path.exists(schedule_path):
+        log('Sin limpieza programada')
+        return False
+
+    try:
+        with open(schedule_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        log('Error leyendo programación: %s' % str(e))
+        return False
+
+    if not data.get('scheduled'):
+        log('La programación de limpieza está desactivada')
+        return False
+
+    completed = run_clean()
+    if not completed:
+        log('La limpieza no se completó; se conservará para el próximo inicio')
+        return False
+
+    if data.get('repeat', False):
+        log('La limpieza persistente seguirá activa en próximos inicios')
+        return True
+
+    try:
+        os.remove(schedule_path)
+        log('Limpieza de un solo uso consumida')
+    except Exception as e:
+        log('No se pudo eliminar la programación: %s' % str(e))
+    return True
 
 class PlaybackMonitor(KodiPlayerBase):
     def __init__(self, mod):
@@ -130,6 +221,11 @@ class PlaybackMonitor(KodiPlayerBase):
                 self.mod.clean_usb_cachepath(cfg, silent=True)
         except Exception as e:
             log('Auto-limpieza cache USB falló: %s' % str(e))
+        try:
+            if hasattr(self.mod, 'maybe_run_threshold_clean'):
+                self.mod.maybe_run_threshold_clean(source='playback', cache_temp_only=True)
+        except Exception as e:
+            log('Limpieza por umbral tras reproducción falló: %s' % str(e))
 
 
 def run_auto_update_check():
@@ -179,31 +275,20 @@ def run_auto_update_check():
 
 if __name__ == '__main__':
     try:
-        # Esperar a que Kodi esté listo
-        monitor = StartupMonitor()
-        # Dar unos segundos de margen para que inicialice UI
-        for _ in range(20):
-            if monitor.abortRequested():
-                break
-            xbmc.sleep(250)
-        
-        # Comprobar si hay limpieza programada
-        if os.path.exists(schedule_path):
-            try:
-                with open(schedule_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if data.get('scheduled'):
-                    run_clean()
-                    # Si no es repetitivo, desactivar para próximos inicios
-                    if not data.get('repeat', False):
-                        try:
-                            os.remove(schedule_path)
-                        except Exception:
-                            pass
-            except Exception as e:
-                log('Error leyendo programación: %s' % str(e))
+        monitor = create_monitor()
+        addon_data_dir = get_addon_data_dir()
+        if wait_until_kodi_ready(monitor):
+            addon_data_dir = get_addon_data_dir()
+            scheduled_ran = maybe_run_scheduled_clean()
+            if not scheduled_ran:
+                try:
+                    mod = get_default_module()
+                    if hasattr(mod, 'maybe_run_threshold_clean'):
+                        mod.maybe_run_threshold_clean(source='startup')
+                except Exception as e:
+                    log('Error en limpieza por umbral: %s' % str(e))
         else:
-            log('Sin limpieza programada')
+            log('Kodi se cerró o el perfil no estuvo listo; no se ejecutó la limpieza programada')
 
         run_auto_update_check()
 
