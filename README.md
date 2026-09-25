@@ -1,6 +1,8 @@
 # Aspirando Kodi 
 
-<img width="1024" height="1024" alt="icono" src="https://github.com/user-attachments/assets/3321db4d-e6e0-4619-9027-7db537574499" />
+<p align="center">
+<img width="1024" height="1024" alt="icon" src="https://github.com/user-attachments/assets/62c8fa4c-08b7-465a-b589-ed6dc09e76bb" />
+</p>
 
 Herramienta de limpieza y optimización para Kodi: caché, thumbnails, paquetes, temporales, bufering y más ...
 
